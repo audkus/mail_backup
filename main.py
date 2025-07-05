@@ -12,6 +12,8 @@ from datetime import datetime
 import traceback
 import time
 
+ACCOUNT_EMAIL = "steffen@audkus.dk"
+
 # Global list of failed emails (UID, folder)
 failed_emails: List[tuple] = []
 
@@ -56,15 +58,15 @@ def get_or_create_email_address(conn: sqlite3.Connection, email: str) -> Optiona
 
 
 def get_or_create_email(
-    conn: sqlite3.Connection,
-    uid: str,
-    folder: str,
-    subject: str,
-    date: str,
-    body_text: str,
-    body_html: str,
-    attachment_dir: str,
-    message_id: str
+        conn: sqlite3.Connection,
+        uid: str,
+        folder: str,
+        subject: str,
+        date: str,
+        body_text: str,
+        body_html: str,
+        attachment_dir: str,
+        message_id: str
 ) -> int:
     if attachment_dir is not None and not isinstance(attachment_dir, str):
         attachment_dir = str(attachment_dir)
@@ -314,19 +316,19 @@ def is_email_downloaded(conn: sqlite3.Connection, uid: str, folder: str) -> bool
 
 
 def mark_email_downloaded(
-    conn: sqlite3.Connection,
-    uid: str,
-    folder: str,
-    subject: str,
-    sender: str,
-    recipients: str,
-    cc: str,
-    bcc: str,
-    date: str,
-    body_text: str,
-    body_html: str,
-    attachment_dir: str,
-    message_id: str
+        conn: sqlite3.Connection,
+        uid: str,
+        folder: str,
+        subject: str,
+        sender: str,
+        recipients: str,
+        cc: str,
+        bcc: str,
+        date: str,
+        body_text: str,
+        body_html: str,
+        attachment_dir: str,
+        message_id: str
 ) -> None:
     if attachment_dir is not None and not isinstance(attachment_dir, str):
         attachment_dir = str(attachment_dir)
@@ -488,7 +490,16 @@ def create_normalized_tables(conn: sqlite3.Connection) -> None:
     cur.execute('''
         CREATE TABLE IF NOT EXISTS email_address (
             email_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL
+            email TEXT UNIQUE NOT NULL,
+            first_received TEXT,
+            last_received TEXT,
+            received_count INTEGER DEFAULT 0,
+            replied INTEGER DEFAULT 0,
+            newsletter INTEGER DEFAULT 0,
+            first_sent TEXT,
+            last_sent TEXT,
+            sent_count INTEGER DEFAULT 0,
+            last_reply_date TEXT
         )
     ''')
     cur.execute('''
@@ -545,6 +556,107 @@ def ensure_folder_and_uidvalidity(mailbox: MailBox, conn: sqlite3.Connection, fo
         raise RuntimeError(f"UIDVALIDITY mismatch for folder '{folder}'! Backup halted.")
     elif stored_uidvalidity is None:
         set_uidvalidity(conn, folder, current_uidvalidity)
+
+
+def update_email_address_stats(
+        conn: sqlite3.Connection,
+        sender: str,
+        recipients: List[str],
+        email_date: str,
+        subject: str,
+        msg_headers: Optional[dict] = None,
+        log_file="missing_sender.log",
+) -> None:
+    """
+    Update the email_address table with stats from the email.
+
+    Args:
+        conn: sqlite3.Connection
+        sender: The sender's email address.
+        recipients: List of recipient addresses (to, cc, bcc combined)
+        email_date: Email date (ISO string, e.g. "2024-06-21T10:12:00")
+        subject: Email subject.
+        msg_headers: Optional dict of headers for newsletter detection.
+        log_file: register missing sender e-mails
+    """
+    if not sender or not isinstance(sender, str):
+        # Optionally log and skip
+        print(f"Skipping email: no sender (subject={subject!r}, date={email_date})")
+        return
+
+    cursor = conn.cursor()
+    # Is this an incoming mail (received) or outgoing (sent)?
+    is_incoming = (sender.lower() != ACCOUNT_EMAIL.lower())
+
+    now = datetime.now().isoformat()
+
+    # -- Process sender stats (only for incoming) --
+    if is_incoming:
+        # Insert if missing
+        cursor.execute(
+            "INSERT OR IGNORE INTO email_address (email, first_received, last_received, received_count) VALUES (?, ?, ?, ?)",
+            (sender, email_date, email_date, 0)
+        )
+        # Update stats
+        cursor.execute(
+            """
+            UPDATE email_address
+            SET 
+                first_received = COALESCE(first_received, ?),
+                last_received = CASE WHEN last_received IS NULL OR ? > last_received THEN ? ELSE last_received END,
+                received_count = COALESCE(received_count, 0) + 1
+            WHERE email = ?
+            """,
+            (email_date, email_date, email_date, sender)
+        )
+        # Optionally detect newsletters
+        if msg_headers and detect_newsletter(sender, msg_headers, subject):
+            cursor.execute(
+                "UPDATE email_address SET newsletter = 1 WHERE email = ?", (sender,)
+            )
+    else:
+        # Process as sent: sender is you, so update recipients
+        for rcpt in recipients:
+            rcpt = rcpt.lower()
+            cursor.execute(
+                "INSERT OR IGNORE INTO email_address (email, first_sent, last_sent, sent_count) VALUES (?, ?, ?, ?)",
+                (rcpt, email_date, email_date, 0)
+            )
+            cursor.execute(
+                """
+                UPDATE email_address
+                SET 
+                    first_sent = COALESCE(first_sent, ?),
+                    last_sent = CASE WHEN last_sent IS NULL OR ? > last_sent THEN ? ELSE last_sent END,
+                    sent_count = COALESCE(sent_count, 0) + 1
+                WHERE email = ?
+                """,
+                (email_date, email_date, email_date, rcpt)
+            )
+            # Mark as "replied" if you have now replied to this contact
+            cursor.execute(
+                "UPDATE email_address SET replied = 1, last_reply_date = ? WHERE email = ?",
+                (email_date, rcpt)
+            )
+
+    conn.commit()
+
+
+def detect_newsletter(sender: str, headers: dict, subject: str) -> bool:
+    """
+    Simple heuristic to flag probable newsletters.
+    Returns True if the mail is likely a newsletter.
+    """
+    sender = sender.lower()
+    # Check for common newsletter clues
+    if "list-unsubscribe" in (k.lower() for k in headers):
+        return True
+    if "newsletter" in sender or "noreply" in sender or "no-reply" in sender:
+        return True
+    subj = subject.lower() if subject else ""
+    if "newsletter" in subj or "unsubscribe" in subj:
+        return True
+    return False
 
 
 def main() -> None:
@@ -634,6 +746,16 @@ def main() -> None:
                                         add_participant(conn, email_pk, cc_addr, 'cc')
                                     for bcc_addr in parse_recipients(msg.bcc):
                                         add_participant(conn, email_pk, bcc_addr, 'bcc')
+
+                                    update_email_address_stats(
+                                        conn,
+                                        sender=msg.from_,
+                                        recipients=(msg.to or []) + (msg.cc or []) + (msg.bcc or []),
+                                        email_date=msg.date.isoformat(),
+                                        subject=msg.subject,
+                                        msg_headers=getattr(msg, "headers", None)
+                                    )
+
                                 except Exception as e:
                                     log(f"❌ Error processing UID {uid}: {e}")
                                     log_error(uid, folder, e)
